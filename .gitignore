@@ -1,0 +1,13 @@
+.codex/
+.venv-wsl/
+__pycache__/
+*.py[cod]
+*.ipynb
+*.tar.gz
+.env
+.kaggle/
+dist/
+artifacts/
+logs/
+replays/
+result.html
