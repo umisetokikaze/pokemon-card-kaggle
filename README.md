@@ -9,6 +9,7 @@
 - `main.py`：盤面と合法手を受け取り、選択する手のインデックスを返すエージェントである。
 - `deck.csv`：カード ID を1行に1枚ずつ、合計60枚記述する。
 - `cg/`：公式のカードゲーム API と Linux 用ネイティブライブラリである。
+- `ptcg_policy/`：Mega Lucario 固有の攻撃・効果評価と、match / turn state を保持する純粋 Python package である。
 
 `cg/libcg.so` は Linux 用の ELF 共有ライブラリであるため、ローカル対戦は WSL2 の Ubuntu 22.04 で実行する。
 
@@ -97,12 +98,12 @@ arena が fault を検出した場合も JSON は保存されるが、PowerShell
 集計処理の unit test は、native engine を使わず Windows と WSL の両方で実行できる。
 
 ```powershell
-python -m unittest -v tests.test_arena_core tests.test_arena_runner
+python -m unittest -v tests.test_attack_semantics tests.test_policy_state tests.test_arena_core tests.test_arena_runner
 ```
 
 ## 提出物の作成
 
-次のコマンドは、`main.py`、`deck.csv`、`cg/` だけを `dist/submission.tar.gz` へ格納する。
+次のコマンドは、`main.py`、`deck.csv`、`cg/`、`ptcg_policy/` を `dist/submission.tar.gz` へ格納する。
 
 ```powershell
 pwsh -File .\tools\build_submission.ps1

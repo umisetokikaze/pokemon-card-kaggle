@@ -37,6 +37,10 @@ foreach ($entry in $entries) {
     }
 }
 
+if ($entries | Where-Object { $_ -like "*/__pycache__/*" -or $_ -like "*.pyc" }) {
+    throw "The submission archive must not contain Python bytecode caches."
+}
+
 foreach ($required in @("main.py", "deck.csv")) {
     if ($entries -notcontains $required) {
         throw "$required must exist at the top level of the archive."
@@ -45,6 +49,10 @@ foreach ($required in @("main.py", "deck.csv")) {
 
 if (-not ($entries | Where-Object { $_ -like "cg/*" })) {
     throw "The cg engine package is missing from the archive."
+}
+
+if (-not ($entries | Where-Object { $_ -like "ptcg_policy/*" })) {
+    throw "The ptcg_policy package is missing from the archive."
 }
 
 $mainText = ((& tar -xOf $ArchivePath "main.py") -join "`n")
@@ -72,4 +80,3 @@ Write-Host "PASS: $ArchivePath"
 Write-Host "  Size: $($archive.Length) bytes"
 Write-Host "  Deck: 60 cards"
 Write-Host "  Entry point: main.py::agent"
-

@@ -1,8 +1,30 @@
 import os
-import sys
 from collections import defaultdict
 
-from cg.api import AreaType, CardType, EnergyType, Observation, SelectContext, OptionType, Card, Pokemon, all_card_data, to_observation_class
+from cg.api import (
+    AreaType,
+    CardType,
+    EnergyType,
+    LogType,
+    Observation,
+    SelectContext,
+    OptionType,
+    Card,
+    Pokemon,
+    all_card_data,
+    to_observation_class,
+)
+from ptcg_policy import (
+    ATTACK_AURA_JAB,
+    ATTACK_COSMIC_BEAM,
+    ATTACK_MEGA_BRAVE,
+    ATTACK_WILD_PRESS,
+    AttackContext,
+    AttackPlan,
+    PolicyState,
+    can_plan_active_attack,
+    evaluate_attack,
+)
 
 """
 Mega Lucario ex Deck
@@ -22,7 +44,7 @@ for i in range(60):
 
 # Fetch card metadata database and create an ID-to-Card lookup table
 all_card = all_card_data()
-card_table = {c.cardId:c for c in all_card}
+card_table = {c.cardId: c for c in all_card}
 
 # Decklist
 Makuhita = 673  # ×2
@@ -44,41 +66,57 @@ Gravity_Mountain = 1252  # ×2
 Basic_Fighting_Energy = 6  # ×13
 
 
-class AttackPlan:
-    attacker = -1
-    target = -1
-    attack_index = -1
-    remain_hp = -1
-    energy = False
+policy_state = PolicyState()
 
 
-plan = AttackPlan()
-pre_turn = 0
-ability_used = False
+def reset_for_match() -> None:
+    """Reset state when the arena loads this module for a new match."""
+
+    policy_state.reset_match()
 
 
-def get_card(obs: Observation, area: AreaType, index: int, player_index: int) -> Pokemon | Card | None:
+def get_card(
+    obs: Observation,
+    area: AreaType | None,
+    index: int | None,
+    player_index: int | None,
+) -> Pokemon | Card | None:
     """Helper function to safely extract a Card or Pokemon object from specific zones."""
-    ps = obs.current.players[player_index]
-    match area:
-        case AreaType.DECK:
-            return obs.select.deck[index]
-        case AreaType.HAND:
-            return ps.hand[index]
-        case AreaType.DISCARD:
-            return ps.discard[index]
-        case AreaType.ACTIVE:
-            return ps.active[index]
-        case AreaType.BENCH:
-            return ps.bench[index]
-        case AreaType.PRIZE:
-            return ps.prize[index]
-        case AreaType.STADIUM:
-            return obs.current.stadium[index]
-        case AreaType.LOOKING:
-            return obs.current.looking[index]
-        case _:
-            return None
+    state = obs.current
+    if state is None or area is None or index is None or player_index is None:
+        return None
+    if not 0 <= player_index < len(state.players):
+        return None
+
+    ps = state.players[player_index]
+    try:
+        match area:
+            case AreaType.DECK:
+                if obs.select is None or obs.select.deck is None:
+                    return None
+                return obs.select.deck[index]
+            case AreaType.HAND:
+                if ps.hand is None:
+                    return None
+                return ps.hand[index]
+            case AreaType.DISCARD:
+                return ps.discard[index]
+            case AreaType.ACTIVE:
+                return ps.active[index]
+            case AreaType.BENCH:
+                return ps.bench[index]
+            case AreaType.PRIZE:
+                return ps.prize[index]
+            case AreaType.STADIUM:
+                return state.stadium[index]
+            case AreaType.LOOKING:
+                if state.looking is None:
+                    return None
+                return state.looking[index]
+            case _:
+                return None
+    except IndexError:
+        return None
 
 
 def prize_count(pokemon: Pokemon) -> int:
@@ -104,7 +142,7 @@ def pokemon_score(pokemon: Pokemon) -> int:
         score += 250
     elif data.stage1:
         score += 130
-    
+
     id = pokemon.id
     # Noctowl, Fan Rotom, Archaludon ex, Meowth ex
     if id == 173 or id == 174 or id == 190 or id == 1071:
@@ -120,18 +158,21 @@ def agent(obs_dict: dict) -> list[int]:
 
     Each element in the returned list must be >= 0 and < len(obs.select.option).
     The list length must be between obs.select.minCount and obs.select.maxCount (inclusive), with no duplicate elements.
-    
+
     Returns:
         list[int]: A list of option index.
     """
     obs = to_observation_class(obs_dict)
-    if obs.select == None:
+    if obs.select is None:
         # In the initial selection, the obs.select is None, and it is necessary to return the deck.
         # The deck is a list of 60 card IDs.
         # The deck must comply with the Pokémon Trading Card Game rules.
+        policy_state.reset_match()
         return my_deck
-        
+
     state = obs.current
+    if state is None:
+        raise ValueError("A non-initial selection must include the current state.")
     select = obs.select
     context = select.context
     my_index = state.yourIndex
@@ -139,22 +180,27 @@ def agent(obs_dict: dict) -> list[int]:
     op_state = state.players[1 - my_index]
     my_prize = len(my_state.prize)
 
-    global plan
-    global pre_turn
-    global ability_used
-    if pre_turn != state.turn:
-        pre_turn = state.turn
-        plan = AttackPlan()
-        ability_used = False
-            
-    field_counts = defaultdict(int)  # Number of cards per card ID on the Bench and in the Active Spot
+    policy_state.begin_turn(state.turn)
+    for log in obs.logs:
+        if (
+            log.type == LogType.SWITCH
+            and log.playerIndex == my_index
+            and log.serialActive == policy_state.mega_brave_locked_serial
+        ):
+            # Moving to the Bench clears Mega Brave's attack lock.
+            policy_state.clear_mega_brave_lock()
+    plan = policy_state.plan
+
+    field_counts = defaultdict(
+        int
+    )  # Number of cards per card ID on the Bench and in the Active Spot
     hand_counts = defaultdict(int)  # Number of cards per card ID in hand
     discard_counts = defaultdict(int)  # Number of cards per card ID in discard pile
 
     attacker1 = False
     attacker2 = False
     for card in my_state.active + my_state.bench:
-        if card == None:
+        if card is None:
             continue
         field_counts[card.id] += 1
         if card.id == Makuhita or card.id == Hariyama:
@@ -164,7 +210,7 @@ def agent(obs_dict: dict) -> list[int]:
             if len(card.energies) >= 2:
                 attacker1 = True
 
-    for card in my_state.hand:
+    for card in my_state.hand or []:
         hand_counts[card.id] += 1
 
     for card in my_state.discard:
@@ -173,129 +219,232 @@ def agent(obs_dict: dict) -> list[int]:
     stadium_id = 0
     for card in state.stadium:
         stadium_id = card.id
-            
-    can_attack = False
+
     if context == SelectContext.MAIN:
         can_switch = False
         can_op_switch = False
-        can_use_mega_brave = False
-        for o in select.option:
-            if o.type == OptionType.PLAY:
-                card = get_card(obs, AreaType.HAND, o.index, my_index)
+        active_attack_ids = set()
+        hariyama_evolve_targets = set()
+        for option in select.option:
+            if option.type == OptionType.PLAY and option.index is not None:
+                card = get_card(obs, AreaType.HAND, option.index, my_index)
+                if card is None:
+                    continue
                 if card.id == Switch:
                     can_switch = True
                 elif card.id == Boss_Orders:
                     can_op_switch = True
-            elif o.type == OptionType.EVOLVE:
-                card = get_card(obs, AreaType.HAND, o.index, my_index)
-                if card.id == Hariyama:
-                    can_op_switch = True
-            elif o.type == OptionType.RETREAT:
+            elif option.type == OptionType.EVOLVE and option.index is not None:
+                card = get_card(obs, AreaType.HAND, option.index, my_index)
+                if card is None or card.id != Hariyama:
+                    continue
+                can_op_switch = True
+                if option.inPlayIndex is None:
+                    continue
+                target_index = option.inPlayIndex
+                if option.inPlayArea == AreaType.BENCH:
+                    target_index += 1
+                hariyama_evolve_targets.add(target_index)
+            elif option.type == OptionType.RETREAT:
                 can_switch = True
-            elif o.type == OptionType.ATTACK:
-                can_attack = True
-                if o.attackId == 983:  # Mega Brave
-                    can_use_mega_brave = True
-        
-        my_cards = [my_state.active[0]]
-        for pokemon in my_state.bench:
-            my_cards.append(pokemon)
-        op_cards = [op_state.active[0]]
-        for pokemon in op_state.bench:
-            op_cards.append(pokemon)
+            elif option.type == OptionType.ATTACK and option.attackId is not None:
+                active_attack_ids.add(option.attackId)
+
+        my_cards = [*my_state.active, *my_state.bench]
+        op_cards = [*op_state.active, *op_state.bench]
+        best_plan = AttackPlan()
 
         if state.turn >= 2:
-            best_score = -1
-            for i, my_pokemon in enumerate(my_cards):
-                if i != 0 and not can_switch:
+            best_score = -1.0
+            for attacker_index, my_pokemon in enumerate(my_cards):
+                if my_pokemon is None:
+                    continue
+                if attacker_index != 0 and not can_switch:
                     break
-                for a in range(2):
-                    energy_required = 0
-                    base_damage = 0
-                    base_score = 0
-                    if my_pokemon.id == Mega_Lucario_ex:
-                        if a == 0:
-                            energy_required = 1
-                            base_damage = 130
-                            base_score += 60 * min(3, discard_counts[Basic_Fighting_Energy])
-                        else:
-                            energy_required = 2
-                            base_damage = 270
-                        if my_prize == 2 or my_prize == 3:
-                            base_score -= 500
-                    elif a == 1:
-                        break
-                    elif my_pokemon.id == Hariyama:
-                        energy_required = 3
-                        base_damage = 210
-                    elif my_pokemon.id == Makuhita:
-                        for o in select.option:
-                            if o.type == OptionType.EVOLVE:
-                                index = o.inPlayIndex
-                                if o.inPlayArea == AreaType.BENCH:
-                                    index += 1
-                                if index == i:
-                                    break
-                        else:
-                            break
-                        base_score -= 100
-                        energy_required = 3
-                        base_damage = 210
-                    elif my_pokemon.id == Solrock:
-                        if field_counts[Lunatone] >= 1:
-                            energy_required = 1
-                            base_damage = 70
-                    
-                    if base_damage <= 0:
+
+                attack_ids: tuple[int, ...] = ()
+                setup_score = 0
+                if my_pokemon.id == Mega_Lucario_ex:
+                    attack_ids = (ATTACK_AURA_JAB, ATTACK_MEGA_BRAVE)
+                    if my_prize in (2, 3):
+                        setup_score -= 500
+                elif my_pokemon.id == Hariyama:
+                    attack_ids = (ATTACK_WILD_PRESS,)
+                elif (
+                    my_pokemon.id == Makuhita
+                    and attacker_index in hariyama_evolve_targets
+                ):
+                    attack_ids = (ATTACK_WILD_PRESS,)
+                    setup_score -= 100
+                elif my_pokemon.id == Solrock:
+                    attack_ids = (ATTACK_COSMIC_BEAM,)
+
+                if attacker_index == 0:
+                    bench_after_switch = my_cards[1:]
+                else:
+                    bench_after_switch = [
+                        my_cards[0],
+                        *my_cards[1:attacker_index],
+                        *my_cards[attacker_index + 1 :],
+                    ]
+                has_lunatone_on_bench = any(
+                    pokemon is not None and pokemon.id == Lunatone
+                    for pokemon in bench_after_switch
+                )
+
+                for attack_id in attack_ids:
+                    preview = evaluate_attack(
+                        AttackContext(
+                            attack_id=attack_id,
+                            has_lunatone_on_bench=has_lunatone_on_bench,
+                        )
+                    )
+                    if preview is None:
                         continue
-                    
+
                     more_energy = False
                     energy_count = len(my_pokemon.energies)
-                    if a == 1 and i == 0 and energy_count >= 2 and not can_use_mega_brave:
-                        break
-                    if energy_count < energy_required:
-                        if hand_counts[Basic_Fighting_Energy] >= 1 and not state.energyAttached:
+                    mega_brave_disabled = (
+                        attack_id == ATTACK_MEGA_BRAVE
+                        and attacker_index == 0
+                        and policy_state.mega_brave_disabled(
+                            state.turn, my_pokemon.serial
+                        )
+                    )
+                    if attacker_index == 0 and not can_plan_active_attack(
+                        attack_id=attack_id,
+                        energy_count=energy_count,
+                        energy_required=preview.spec.energy_required,
+                        legal_attack_ids=active_attack_ids,
+                        attack_blocked=(
+                            mega_brave_disabled or my_state.asleep or my_state.paralyzed
+                        ),
+                    ):
+                        continue
+                    if energy_count < preview.spec.energy_required:
+                        if (
+                            hand_counts[Basic_Fighting_Energy] >= 1
+                            and not state.energyAttached
+                        ):
                             energy_count += 1
-                            if energy_count < energy_required:
+                            if energy_count < preview.spec.energy_required:
                                 continue
-                            else:
-                                more_energy = True
+                            more_energy = True
                         else:
                             continue
 
-                    for j, op_pokemon in enumerate(op_cards):
-                        if j != 0 and not can_op_switch:
+                    for target_index, op_pokemon in enumerate(op_cards):
+                        if op_pokemon is None:
+                            continue
+                        if target_index != 0 and not can_op_switch:
                             break
-                        damage = base_damage
-                        data = card_table[op_pokemon.id]
-                        if data.weakness == EnergyType.FIGHTING:
-                            damage *= 2
-                        elif data.resistance == EnergyType.FIGHTING:
-                            damage -= 30
+
+                        target_data = card_table[op_pokemon.id]
+                        attack_context = AttackContext(
+                            attack_id=attack_id,
+                            attacker_is_fighting=(
+                                card_table[my_pokemon.id].energyType
+                                == EnergyType.FIGHTING
+                            ),
+                            target_is_active=True,
+                            target_weak_to_fighting=(
+                                target_data.weakness == EnergyType.FIGHTING
+                            ),
+                            target_resists_fighting=(
+                                target_data.resistance == EnergyType.FIGHTING
+                            ),
+                            premium_power_pro_active=(
+                                policy_state.premium_power_pro_active
+                            ),
+                            has_lunatone_on_bench=has_lunatone_on_bench,
+                            discard_basic_fighting=discard_counts[
+                                Basic_Fighting_Energy
+                            ],
+                            bench_target_count=len(my_state.bench),
+                            attacker_hp=my_pokemon.hp,
+                        )
+                        try:
+                            evaluation = evaluate_attack(attack_context)
+                        except ValueError:
+                            continue
+                        if evaluation is None or evaluation.damage <= 0:
+                            continue
+
+                        premium_evaluation = evaluation
+                        if not policy_state.premium_power_pro_active:
+                            premium_evaluation = evaluate_attack(
+                                AttackContext(
+                                    attack_id=attack_id,
+                                    attacker_is_fighting=(
+                                        card_table[my_pokemon.id].energyType
+                                        == EnergyType.FIGHTING
+                                    ),
+                                    target_is_active=True,
+                                    target_weak_to_fighting=(
+                                        target_data.weakness == EnergyType.FIGHTING
+                                    ),
+                                    target_resists_fighting=(
+                                        target_data.resistance == EnergyType.FIGHTING
+                                    ),
+                                    premium_power_pro_active=True,
+                                    has_lunatone_on_bench=has_lunatone_on_bench,
+                                    discard_basic_fighting=discard_counts[
+                                        Basic_Fighting_Energy
+                                    ],
+                                    bench_target_count=len(my_state.bench),
+                                    attacker_hp=my_pokemon.hp,
+                                )
+                            )
+
                         prize = 0
-                        score = pokemon_score(op_pokemon)
-                        if op_pokemon.hp <= damage:
+                        score = float(pokemon_score(op_pokemon))
+                        if op_pokemon.hp <= evaluation.damage:
                             prize = prize_count(op_pokemon)
                         else:
-                            score *= damage / op_pokemon.hp
-                        score += base_score
-                            
+                            score *= evaluation.damage / op_pokemon.hp
+                        score += setup_score
+                        score += evaluation.aura_attach_count * 60
+                        score -= evaluation.self_damage * 2
+                        if evaluation.self_knockout:
+                            score -= prize_count(my_pokemon) * 1000
+
                         if len(op_state.prize) <= prize:
                             score = 50000
-                        
-                        if i == 0:
+
+                        if attacker_index == 0:
                             score += 220
-                        if j == 0:
+                        if target_index == 0:
                             score += 300
                         score += energy_count
+
                         if best_score < score:
                             best_score = score
-                            plan.attacker = i
-                            plan.target = j
-                            plan.attack_index = a
-                            plan.remain_hp = op_pokemon.hp - damage
-                            plan.energy = more_energy
-    
+                            premium_damage = (
+                                premium_evaluation.damage
+                                if premium_evaluation is not None
+                                else evaluation.damage
+                            )
+                            best_plan = AttackPlan(
+                                attacker=attacker_index,
+                                target=target_index,
+                                attack_id=attack_id,
+                                remain_hp=op_pokemon.hp - evaluation.damage,
+                                energy=more_energy,
+                                damage=evaluation.damage,
+                                self_damage=evaluation.self_damage,
+                                aura_attach_count=evaluation.aura_attach_count,
+                                premium_damage_gain=max(
+                                    0,
+                                    premium_damage - evaluation.damage,
+                                ),
+                                premium_enables_knockout=(
+                                    evaluation.damage < op_pokemon.hp <= premium_damage
+                                ),
+                            )
+
+        policy_state.plan = best_plan
+        plan = policy_state.plan
+
     # Attach energy score
     def energy_score(pokemon: Pokemon, active: bool) -> int:
         energy_count = len(pokemon.energies)
@@ -335,11 +484,14 @@ def agent(obs_dict: dict) -> list[int]:
             score = 1  # Prefer "Yes"
         elif o.type == OptionType.CARD:
             card = get_card(obs, o.area, o.index, o.playerIndex)
-            if card != None:
+            if card is not None:
                 energy_count = 0
                 if isinstance(card, Pokemon):
                     energy_count = len(card.energies)
-                if context == SelectContext.SWITCH or context == SelectContext.TO_ACTIVE:
+                if (
+                    context == SelectContext.SWITCH
+                    or context == SelectContext.TO_ACTIVE
+                ):
                     # Selection of the Pokémon to send to the Active Spot
                     if o.playerIndex == my_index:
                         score += energy_count * 2
@@ -407,7 +559,7 @@ def agent(obs_dict: dict) -> list[int]:
                         else:
                             score -= 15
                     elif card.id == Basic_Fighting_Energy:
-                        if not ability_used or not state.energyAttached:
+                        if not policy_state.ability_used or not state.energyAttached:
                             score += 30
                         else:
                             score -= 1
@@ -432,13 +584,14 @@ def agent(obs_dict: dict) -> list[int]:
                     else:
                         score = 6000
                 elif card.id == Premium_Power_Pro:
-                    if state.supporterPlayed and plan.remain_hp <= 0:
+                    if (
+                        plan.attacker < 0
+                        or plan.premium_damage_gain <= 0
+                        or plan.remain_hp <= 0
+                    ):
                         score = -1
-                    elif not can_attack:
-                        if not state.supporterPlayed and hand_counts[Carmine] > 0 and hand_counts[Lillie_Determination] == 0:
-                            score = 3050
-                        else:
-                            score = -1
+                    elif plan.premium_enables_knockout:
+                        score = 6500
                     else:
                         score = 5000
                 elif card.id == Boss_Orders:
@@ -488,21 +641,27 @@ def agent(obs_dict: dict) -> list[int]:
                 score = -1
         elif o.type == OptionType.ATTACK:
             score = 1000
-            if plan.attack_index == 1:
-                if o.attackId == 983:  # Mega Brave
-                    score += 100
-            else:
-                if o.attackId != 983:
-                    score += 100
+            if o.attackId == plan.attack_id:
+                score += 100
 
         scores.append(score)
 
     # Select in descending order of score
-    desc_indices = [i for i, _ in sorted(enumerate(scores), key=lambda x: x[1], reverse=True)]
+    desc_indices = [
+        i for i, _ in sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    ]
     if context == SelectContext.MAIN:
         o = select.option[desc_indices[0]]
         if o.type == OptionType.ABILITY:
             card = get_card(obs, o.area, o.index, my_index)
-            if card.id == Lunatone:
-                ability_used = True
-    return desc_indices[:select.maxCount]
+            if card is not None and card.id == Lunatone:
+                policy_state.ability_used = True
+        elif o.type == OptionType.PLAY:
+            card = get_card(obs, AreaType.HAND, o.index, my_index)
+            if card is not None and card.id == Premium_Power_Pro:
+                policy_state.premium_power_pro_active = True
+        elif o.type == OptionType.ATTACK and o.attackId == ATTACK_MEGA_BRAVE:
+            active = my_state.active[0] if my_state.active else None
+            if active is not None:
+                policy_state.note_mega_brave(state.turn, active.serial)
+    return desc_indices[: select.maxCount]
